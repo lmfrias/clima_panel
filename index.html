@@ -382,10 +382,65 @@
             margin-bottom: var(--gap);
         }
 
+        .map-toolbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin: -6px 0 10px;
+        }
+
         .map-hint {
             color: var(--text-secondary);
             font-size: 0.78rem;
-            margin: -6px 0 10px;
+            margin: 0;
+        }
+
+        .btn-toggle {
+            background: var(--surface);
+            color: var(--text-primary);
+            border: 1px solid var(--border);
+            padding: 6px 12px;
+            font-size: 0.8rem;
+            white-space: nowrap;
+        }
+
+        .btn-toggle[aria-pressed="true"] {
+            background: var(--accent);
+            color: #fff;
+            border-color: transparent;
+        }
+
+        .btn-toggle[data-loading="true"] {
+            opacity: 0.6;
+            cursor: progress;
+        }
+
+        .wind-canvas {
+            position: absolute;
+            pointer-events: none;
+        }
+
+        .wind-legend {
+            display: none;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.7rem;
+            color: var(--text-secondary);
+            margin-top: 8px;
+        }
+
+        .wind-legend.active {
+            display: flex;
+        }
+
+        .wind-legend-bar {
+            flex: 1;
+            max-width: 180px;
+            height: 6px;
+            border-radius: 3px;
+            background: linear-gradient(90deg, #0d47a1, #00796b, #bf6900, #c63c0a, #9b1414);
         }
 
         #map {
@@ -705,8 +760,17 @@
             <!-- Map -->
             <div class="card map-section">
                 <div class="section-title">🗺️ Mapa</div>
-                <p class="map-hint">Hacé click en el mapa para ver el clima de ese punto.</p>
+                <div class="map-toolbar">
+                    <p class="map-hint">Hacé click en el mapa para ver el clima de ese punto.</p>
+                    <button class="btn btn-toggle" id="wind-btn" aria-pressed="false">💨 Viento animado</button>
+                </div>
                 <div id="map"></div>
+                <div class="wind-legend" id="wind-legend">
+                    <span>Flojo</span>
+                    <span class="wind-legend-bar"></span>
+                    <span>Fuerte</span>
+                    <span id="wind-legend-note"></span>
+                </div>
             </div>
 
             <!-- Air quality -->
@@ -830,6 +894,7 @@
         let currentPlace = null;
         let map = null;
         let marker = null;
+        let windLayer = null;
         let debounceTimer = null;
 
         const $ = (id) => document.getElementById(id);
@@ -948,6 +1013,311 @@
             map.setView([lat, lon], zoom);
             if (marker) map.removeLayer(marker);
             marker = L.marker([lat, lon]).addTo(map);
+        }
+
+        /* ---------- capa de viento animada ---------- */
+
+        // Ajustes visuales: tocá estos números para más/menos densidad o velocidad.
+        const WIND_COLS = 12;          // puntos de grilla a lo ancho
+        const WIND_ROWS = 8;           // puntos de grilla a lo alto (12x8 = 96 consultas)
+        const WIND_PARTICLES = 800;
+        const WIND_PX_PER_MS = 3.5;    // píxeles/segundo por cada m/s (exageración visual)
+        const WIND_MAX_AGE = 110;      // frames antes de reciclar una partícula
+        const WIND_FADE = 0.93;        // 0 = sin estela, 0.99 = estela muy larga
+        const WIND_PAD = 0.15;         // margen de grilla fuera del viewport
+        const WIND_WIDTH = 1.8;        // grosor de la estela en px
+        const WIND_SNAP = 0.25;        // redondeo del bbox en grados (agrupa viewports en el caché)
+        const WIND_CACHE_MAX = 40;     // entradas máximas del caché en memoria
+
+        // Colores oscuros y saturados: el mapa base de OSM es claro y los tonos
+        // pastel quedaban con un contraste casi nulo contra el fondo.
+        const WIND_COLORS = [
+            [3, 'rgba(13, 71, 161, 0.95)'],
+            [7, 'rgba(0, 121, 107, 0.95)'],
+            [12, 'rgba(191, 105, 0, 0.97)'],
+            [18, 'rgba(198, 60, 10, 0.98)'],
+            [Infinity, 'rgba(155, 20, 20, 1)']
+        ];
+
+        const windColor = (speed) => WIND_COLORS.find(([limit]) => speed <= limit)[1];
+
+        // Redondea el bbox (con el WIND_PAD ya aplicado) hacia AFUERA a múltiplos
+        // de WIND_SNAP. Viewports parecidos caen así en el mismo bbox y comparten
+        // caché. Devuelve null si el área no es válida.
+        function windBBox(bounds) {
+            const north = Math.min(bounds.getNorth(), 84);
+            const south = Math.max(bounds.getSouth(), -84);
+            const oeste = Math.max(bounds.getWest(), -180);
+            const este = Math.min(bounds.getEast(), 180);
+            if (north <= south || este <= oeste) return null;
+
+            const padLat = (north - south) * WIND_PAD;
+            const padLon = (este - oeste) * WIND_PAD;
+
+            // floor para los bordes sur/oeste y ceil para norte/este: siempre hacia afuera.
+            const snap = (v, haciaArriba) =>
+                (haciaArriba ? Math.ceil(v / WIND_SNAP) : Math.floor(v / WIND_SNAP)) * WIND_SNAP;
+
+            // Los topes (±84, ±180) son múltiplos exactos de 0.25, así que recortar
+            // después de redondear no rompe el alineado de la grilla.
+            let top = Math.min(snap(north + padLat, true), 84);
+            let bottom = Math.max(snap(south - padLat, false), -84);
+            let west = Math.max(snap(oeste - padLon, false), -180);
+            let east = Math.min(snap(este + padLon, true), 180);
+
+            // A zoom alto el bbox puede colapsar: garantizamos una celda por lado.
+            if (top - bottom < WIND_SNAP) {
+                if (top + WIND_SNAP <= 84) top += WIND_SNAP; else bottom -= WIND_SNAP;
+            }
+            if (east - west < WIND_SNAP) {
+                if (east + WIND_SNAP <= 180) east += WIND_SNAP; else west -= WIND_SNAP;
+            }
+
+            return { top, bottom, west, east };
+        }
+
+        // Caché en memoria del campo de viento. El viento a 10 m se actualiza como
+        // mucho cada hora, así que la clave lleva la hora UTC y se invalida sola.
+        // Guardamos la PROMESA, no el resultado: dos refresh casi simultáneos sobre
+        // el mismo bbox comparten la misma petición en vez de disparar dos.
+        const windCache = new Map();
+
+        function fetchWindField(bounds) {
+            const box = windBBox(bounds);
+            if (!box) return null;
+
+            const hora = new Date().toISOString().slice(0, 13); // YYYY-MM-DDTHH en UTC
+            const clave = `${box.bottom.toFixed(2)},${box.west.toFixed(2)},` +
+                `${box.top.toFixed(2)},${box.east.toFixed(2)}@${hora}`;
+
+            if (windCache.has(clave)) {
+                console.info(`[viento] caché HIT  ${clave}`);
+                return windCache.get(clave);
+            }
+            console.info(`[viento] caché MISS ${clave} → ${WIND_COLS * WIND_ROWS} ubicaciones`);
+
+            const promesa = fetchWindGrid(box);
+            windCache.set(clave, promesa);
+            // Un error de red no debe quedar cacheado: se borra y el próximo reintenta.
+            promesa.catch(() => windCache.delete(clave));
+
+            // Map conserva el orden de inserción: la primera clave es la más vieja.
+            while (windCache.size > WIND_CACHE_MAX) {
+                windCache.delete(windCache.keys().next().value);
+            }
+            return promesa;
+        }
+
+        // Descarga una grilla regular de viento a 10 m sobre el bbox ya redondeado.
+        // Open-Meteo acepta listas de coordenadas en una sola llamada.
+        async function fetchWindGrid({ top, bottom, west, east }) {
+            // lats de norte a sur, lons de oeste a este (orden que espera el interpolador)
+            const lats = Array.from({ length: WIND_ROWS }, (_, j) =>
+                top - (j * (top - bottom)) / (WIND_ROWS - 1));
+            const lons = Array.from({ length: WIND_COLS }, (_, i) =>
+                west + (i * (east - west)) / (WIND_COLS - 1));
+
+            const latList = [];
+            const lonList = [];
+            lats.forEach((lat) => lons.forEach((lon) => {
+                latList.push(lat.toFixed(3));
+                lonList.push(lon.toFixed(3));
+            }));
+
+            const data = await getJSON(
+                `https://api.open-meteo.com/v1/forecast?latitude=${latList.join(',')}` +
+                `&longitude=${lonList.join(',')}` +
+                `&current=wind_speed_10m,wind_direction_10m&wind_speed_unit=ms&timezone=UTC`
+            );
+
+            const points = Array.isArray(data) ? data : [data];
+            const cells = points.map((point) => {
+                const current = point && point.current;
+                const speed = current && current.wind_speed_10m;
+                const dir = current && current.wind_direction_10m;
+                if (!hasValue(speed) || !hasValue(dir)) return null;
+                // La dirección meteorológica indica de dónde viene el viento: se invierte.
+                const rad = (dir * Math.PI) / 180;
+                return { u: -speed * Math.sin(rad), v: -speed * Math.cos(rad), speed };
+            });
+
+            return cells.some(Boolean) ? { lats, lons, cells } : null;
+        }
+
+        function indexFor(values, target) {
+            for (let k = 0; k < values.length - 1; k++) {
+                if (target >= values[k] && target <= values[k + 1]) return k;
+            }
+            return -1;
+        }
+
+        const AnimatedWindLayer = L.Layer.extend({
+            onAdd(map) {
+                this._map = map;
+                this._canvas = L.DomUtil.create('canvas', 'wind-canvas');
+                this._ctx = this._canvas.getContext('2d');
+                map.getPanes().overlayPane.appendChild(this._canvas);
+                map.on('movestart zoomstart', this._pause, this);
+                map.on('moveend zoomend resize', this._refresh, this);
+                this._particles = Array.from({ length: WIND_PARTICLES }, () => ({ x: 0, y: 0, age: 0 }));
+                this._refresh();
+                return this;
+            },
+
+            onRemove(map) {
+                this._pause();
+                this._token = {};
+                map.off('movestart zoomstart', this._pause, this);
+                map.off('moveend zoomend resize', this._refresh, this);
+                L.DomUtil.remove(this._canvas);
+                this._canvas = null;
+                this._field = null;
+                return this;
+            },
+
+            // Durante el paneo/zoom no dibujamos: el canvas se recoloca al terminar.
+            _pause() {
+                clearTimeout(this._timer);
+                if (this._frame) cancelAnimationFrame(this._frame);
+                this._frame = null;
+                if (this._ctx) this._ctx.clearRect(0, 0, this._w || 0, this._h || 0);
+            },
+
+            _refresh() {
+                this._pause();
+                this._resize();
+                this._timer = setTimeout(() => this._load(), 400); // no golpeamos la API en cada gesto
+            },
+
+            _resize() {
+                const size = this._map.getSize();
+                const dpr = Math.min(window.devicePixelRatio || 1, 2);
+                this._w = size.x;
+                this._h = size.y;
+                this._canvas.width = size.x * dpr;
+                this._canvas.height = size.y * dpr;
+                this._canvas.style.width = `${size.x}px`;
+                this._canvas.style.height = `${size.y}px`;
+                this._ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+                L.DomUtil.setPosition(this._canvas, this._map.containerPointToLayerPoint([0, 0]));
+            },
+
+            async _load() {
+                const token = (this._token = {});
+                this.fire('windloading');
+                let field = null;
+                try {
+                    field = await fetchWindField(this._map.getBounds());
+                } catch {
+                    field = null;
+                }
+                if (token !== this._token || !this._canvas) return;
+                this._field = field ? this._project(field) : null;
+                this.fire('windloaded', { ok: Boolean(this._field) });
+                if (!this._field) return;
+                this._particles.forEach((p) => this._reset(p, true));
+                this._step();
+            },
+
+            // Pasamos la grilla lat/lon a coordenadas de pantalla una sola vez.
+            _project(field) {
+                const map = this._map;
+                return {
+                    cells: field.cells,
+                    cols: field.lons.length,
+                    xs: field.lons.map((lon) => map.latLngToContainerPoint([field.lats[0], lon]).x),
+                    ys: field.lats.map((lat) => map.latLngToContainerPoint([lat, field.lons[0]]).y)
+                };
+            },
+
+            _sample(x, y) {
+                const f = this._field;
+                if (!f) return null;
+                const i = indexFor(f.xs, x);
+                const j = indexFor(f.ys, y);
+                if (i < 0 || j < 0) return null;
+
+                const at = (row, col) => f.cells[row * f.cols + col];
+                const a = at(j, i), b = at(j, i + 1), c = at(j + 1, i), d = at(j + 1, i + 1);
+                if (!a || !b || !c || !d) return null;
+
+                const tx = (x - f.xs[i]) / (f.xs[i + 1] - f.xs[i]);
+                const ty = (y - f.ys[j]) / (f.ys[j + 1] - f.ys[j]);
+                const lerp = (p, q, t) => p + (q - p) * t;
+                return {
+                    u: lerp(lerp(a.u, b.u, tx), lerp(c.u, d.u, tx), ty),
+                    v: lerp(lerp(a.v, b.v, tx), lerp(c.v, d.v, tx), ty)
+                };
+            },
+
+            _reset(p, spread = false) {
+                p.x = Math.random() * this._w;
+                p.y = Math.random() * this._h;
+                p.age = spread ? Math.floor(Math.random() * WIND_MAX_AGE) : WIND_MAX_AGE;
+            },
+
+            _step() {
+                const ctx = this._ctx;
+                if (!ctx) return;
+
+                // Desvanece lo dibujado antes: eso genera la estela.
+                ctx.globalCompositeOperation = 'destination-in';
+                ctx.fillStyle = `rgba(0, 0, 0, ${WIND_FADE})`;
+                ctx.fillRect(0, 0, this._w, this._h);
+                ctx.globalCompositeOperation = 'source-over';
+                ctx.lineWidth = WIND_WIDTH;
+                ctx.lineCap = 'round';
+
+                const dt = 1 / 60;
+                this._particles.forEach((p) => {
+                    if (--p.age <= 0) this._reset(p);
+                    const wind = this._sample(p.x, p.y);
+                    if (!wind) {
+                        this._reset(p);
+                        return;
+                    }
+                    const nx = p.x + wind.u * WIND_PX_PER_MS * dt;
+                    const ny = p.y - wind.v * WIND_PX_PER_MS * dt; // el eje Y del canvas crece hacia abajo
+
+                    ctx.strokeStyle = windColor(Math.hypot(wind.u, wind.v));
+                    ctx.beginPath();
+                    ctx.moveTo(p.x, p.y);
+                    ctx.lineTo(nx, ny);
+                    ctx.stroke();
+
+                    p.x = nx;
+                    p.y = ny;
+                    if (nx < 0 || nx > this._w || ny < 0 || ny > this._h) this._reset(p);
+                });
+
+                this._frame = requestAnimationFrame(() => this._step());
+            }
+        });
+
+        function toggleWind() {
+            ensureMap();
+            const btn = $('wind-btn');
+            const legend = $('wind-legend');
+
+            if (windLayer) {
+                map.removeLayer(windLayer);
+                windLayer = null;
+                btn.setAttribute('aria-pressed', 'false');
+                btn.removeAttribute('data-loading');
+                legend.classList.remove('active');
+                $('wind-legend-note').textContent = '';
+                return;
+            }
+
+            windLayer = new AnimatedWindLayer();
+            windLayer.on('windloading', () => btn.setAttribute('data-loading', 'true'));
+            windLayer.on('windloaded', (e) => {
+                btn.removeAttribute('data-loading');
+                $('wind-legend-note').textContent = e.ok ? '' : '· sin datos en esta zona';
+            });
+            windLayer.addTo(map);
+            btn.setAttribute('aria-pressed', 'true');
+            legend.classList.add('active');
         }
 
         /* ---------- autocomplete ---------- */
@@ -1223,6 +1593,7 @@
         $('search-btn').addEventListener('click', searchCity);
         $('retry-btn').addEventListener('click', init);
         $('locate-btn').addEventListener('click', locateMe);
+        $('wind-btn').addEventListener('click', toggleWind);
 
         $('search-input').addEventListener('keydown', (e) => {
             if (e.key === 'Enter') {
